@@ -8,6 +8,51 @@ from typing import Optional
 from audio.capture import AudioCapture, AudioCaptureError
 from audio.monitor import AudioMonitor, AudioMetrics
 from utils.config import config
+from PyObjCTools import AppHelper  # Legacy; keeping for fallback
+import objc
+import Foundation
+import CoreFoundation
+import AppKit
+
+# A dedicated controller for the NSTimer to avoid conflicts with rumps' object lifecycle.
+class UITimer(AppKit.NSObject):
+    _app: 'MusicBarApp' = objc.ivar()
+    _timer: Optional[AppKit.NSTimer] = objc.ivar()
+
+    @objc.selector
+    def initWithApp_(self, app: 'MusicBarApp'):
+        self = objc.super(UITimer, self).init()
+        if self is None:
+            return None
+        self._app = app
+        self._timer = None
+        return self
+
+    @objc.python_method
+    def start(self, interval: float):
+        self.stop()
+        if config.debug:
+            print(f"Starting UITimer with interval: {interval}")
+        self._timer = AppKit.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            interval, self, b'tick:', None, True
+        )
+        AppKit.NSRunLoop.currentRunLoop().addTimer_forMode_(
+            self._timer, AppKit.NSRunLoopCommonModes
+        )
+
+    @objc.python_method
+    def stop(self):
+        if self._timer and self._timer.isValid():
+            if config.debug:
+                print("Stopping UITimer")
+            self._timer.invalidate()
+            self._timer = None
+
+    @objc.selector
+    def tick_(self, timer: AppKit.NSTimer):
+        if self._app:
+            self._app._refresh_display()
+
 
 class MusicBarApp(rumps.App):
     """Main menu bar application."""
@@ -30,7 +75,7 @@ class MusicBarApp(rumps.App):
         
         # State management
         self.is_monitoring = False
-        self._update_timer = None
+        self._ui_timer: UITimer = UITimer.alloc().initWithApp_(self)
         
         # Menu items
         self._setup_menu()
@@ -47,8 +92,11 @@ class MusicBarApp(rumps.App):
             # Force update the menu bar
             self.title = "♪"
             # Try to force a refresh
-            import AppKit
-            AppKit.NSApp.activateIgnoringOtherApps_(True)
+            try:
+                if AppKit.NSApp() is not None:
+                    AppKit.NSApp().activateIgnoringOtherApps_(True)
+            except Exception:
+                pass  # benign; icon will show once menu is clicked
             if config.debug:
                 print("♪ Menu bar icon should now be visible")
         except Exception as e:
@@ -63,9 +111,15 @@ class MusicBarApp(rumps.App):
         self.menu.add(rumps.separator)
         
         # Audio metrics section - these will auto-update when monitoring
-        self.volume_item = rumps.MenuItem("Volume: --")
-        self.stereo_item = rumps.MenuItem("Stereo: --")  
-        self.frequency_item = rumps.MenuItem("Peak Freq: --")
+        # NOTE: Disabled (greyed-out) NSMenuItems do not visually refresh their
+        # title while the menu is tracking.  To ensure the numbers change in
+        # real-time we keep them *enabled* but attach a no-op callback so the
+        # user can't accidentally trigger anything.
+        noop = lambda _: None  # harmless placeholder callback
+        
+        self.volume_item = rumps.MenuItem("Volume: --", callback=noop)
+        self.stereo_item = rumps.MenuItem("Stereo: --", callback=noop)
+        self.frequency_item = rumps.MenuItem("Peak Freq: --", callback=noop)
         
         self.menu.add(self.volume_item)
         self.menu.add(self.stereo_item)
@@ -261,7 +315,7 @@ class MusicBarApp(rumps.App):
             self.status_item.title = f"♪ Monitoring {source_name}..."
             
             # Start update timer for live updates
-            self._start_update_timer()
+            self._ui_timer.start(config.ui.update_interval)
             
             if config.debug:
                 print(f"Audio monitoring started ({source_name})")
@@ -289,37 +343,16 @@ class MusicBarApp(rumps.App):
         self.frequency_item.title = "Peak Freq: --"
         
         # Stop update timer
-        self._stop_update_timer()
+        self._ui_timer.stop()
         
         if config.debug:
             print("Audio monitoring stopped")
     
-    def _start_update_timer(self):
-        """Start the UI update timer."""
-        self._stop_update_timer()  # Ensure no duplicate timers
-        
+    @objc.python_method
+    def _refresh_display(self):
+        """Refresh the display with current audio metrics. Called by our UITimer."""
         if config.debug:
-            print(f"Starting update timer with interval: {config.ui.update_interval}")
-        
-        self._update_timer = rumps.Timer(
-            self._refresh_display,
-            config.ui.update_interval
-        )
-        self._update_timer.start()
-        
-        if config.debug:
-            print("✅ Update timer started")
-    
-    def _stop_update_timer(self):
-        """Stop the UI update timer."""
-        if self._update_timer:
-            if config.debug:
-                print("Stopping update timer")
-            self._update_timer.stop()
-            self._update_timer = None
-    
-    def _refresh_display(self, sender=None):
-        """Refresh the display with current audio metrics - can be called by timer or manually."""
+            print("--- _refresh_display called ---")
         if not self.is_monitoring:
             return
         
@@ -332,7 +365,7 @@ class MusicBarApp(rumps.App):
             # Update volume display
             if metrics.overall_volume > 0.001:  # Avoid showing tiny values
                 volume_text = f"Volume: {volume_db['overall_db']:.1f}dB"
-                if config.debug and sender is None:  # Only debug on timer calls, not manual
+                if config.debug:
                     print(f"Volume: {volume_db['overall_db']:.1f}dB")
                 
                 # Update title icon based on volume level
@@ -364,11 +397,15 @@ class MusicBarApp(rumps.App):
             else:
                 freq_text = "Peak Freq: --"
             
-            # Apply all updates at once
+            # Since this runs on the main thread, we can update UI directly.
             self.volume_item.title = volume_text
             self.stereo_item.title = stereo_text
             self.frequency_item.title = freq_text
             self.title = new_title
+
+            # Explicitly update the menu to force a redraw while it's open.
+            if hasattr(self.menu, '_menu') and self.menu._menu is not None:
+                self.menu._menu.update()
             
         except Exception as e:
             if config.debug:
