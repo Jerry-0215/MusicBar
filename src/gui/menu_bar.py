@@ -5,10 +5,9 @@ import rumps
 import threading
 import time
 from typing import Optional
-from ..audio.capture import AudioCapture, AudioCaptureError
-from ..audio.system_capture import SystemAudioCapture, SystemAudioCaptureError
-from ..audio.monitor import AudioMonitor, AudioMetrics
-from ..utils.config import config
+from audio.capture import AudioCapture, AudioCaptureError
+from audio.monitor import AudioMonitor, AudioMetrics
+from utils.config import config
 
 class MusicBarApp(rumps.App):
     """Main menu bar application."""
@@ -17,14 +16,13 @@ class MusicBarApp(rumps.App):
         # Initialize rumps app
         super(MusicBarApp, self).__init__(
             name=config.app_name,
-            title="🎵",  # Initial icon
+            title="♪",  # White musical note for better visibility
             quit_button=None  # We'll add our own quit
         )
         
         # Initialize components
         self.audio_monitor = AudioMonitor(update_callback=self._on_audio_update)
         self.audio_capture = AudioCapture(callback=self.audio_monitor.process_audio)
-        self.system_capture = SystemAudioCapture(callback=self.audio_monitor.process_audio)
         
         # Current capture mode
         self.use_system_audio = False
@@ -47,12 +45,12 @@ class MusicBarApp(rumps.App):
         """Ensure the menu bar icon is visible."""
         try:
             # Force update the menu bar
-            self.title = "🎵"
+            self.title = "♪"
             # Try to force a refresh
             import AppKit
             AppKit.NSApp.activateIgnoringOtherApps_(True)
             if config.debug:
-                print("🎵 Menu bar icon should now be visible")
+                print("♪ Menu bar icon should now be visible")
         except Exception as e:
             if config.debug:
                 print(f"Error ensuring menu bar visibility: {e}")
@@ -64,9 +62,9 @@ class MusicBarApp(rumps.App):
         self.menu.add(self.status_item)
         self.menu.add(rumps.separator)
         
-        # Audio metrics section
+        # Audio metrics section - these will auto-update when monitoring
         self.volume_item = rumps.MenuItem("Volume: --")
-        self.stereo_item = rumps.MenuItem("Stereo: --")
+        self.stereo_item = rumps.MenuItem("Stereo: --")  
         self.frequency_item = rumps.MenuItem("Peak Freq: --")
         
         self.menu.add(self.volume_item)
@@ -82,17 +80,7 @@ class MusicBarApp(rumps.App):
         self.menu.add(self.toggle_item)
         
         # Audio source selection - initialize first
-        self.source_menu = rumps.MenuItem("Audio Source")
-        # Add initial items without using clear()
-        self.source_menu.add(rumps.MenuItem(
-            "✓ Microphone Input",
-            callback=lambda sender: self._select_source("microphone")
-        ))
-        self.source_menu.add(rumps.MenuItem(
-            "System Audio (Screen Recording)",
-            callback=lambda sender: self._select_source("system")
-        ))
-        self.menu.add(self.source_menu)
+        # (System audio capture removed, so no source selection needed)
         
         # Device selection (for microphone mode) - initialize first
         self.device_menu = rumps.MenuItem("Microphone Device")
@@ -140,7 +128,7 @@ class MusicBarApp(rumps.App):
             # Update source
             if source_type == "system":
                 self.use_system_audio = True
-                self.current_capture = self.system_capture
+                self.current_capture = self.audio_capture
                 self.device_menu.title = "System Audio Device"
             else:
                 self.use_system_audio = False
@@ -190,13 +178,6 @@ class MusicBarApp(rumps.App):
                     item = self.device_menu._items[0]
                     self.device_menu.remove(item)
             
-            if self.use_system_audio:
-                # System audio info
-                info = self.system_capture.get_device_info()
-                self.device_menu.add(rumps.MenuItem(f"✓ {info['name']}"))
-                self.device_menu.add(rumps.MenuItem(f"Permission: {info['permission_required']}"))
-                return
-            
             # Microphone devices
             devices = AudioCapture.list_devices()
             current_device = self.audio_capture.get_device_info()
@@ -233,10 +214,7 @@ class MusicBarApp(rumps.App):
         self._safe_update_device_menu()
     
     def _select_device(self, device_id: int):
-        """Select a new audio device (for microphone mode)."""
-        if self.use_system_audio:
-            return
-        
+        """Select a new audio device."""
         try:
             # Stop current monitoring
             was_monitoring = self.is_monitoring
@@ -271,31 +249,24 @@ class MusicBarApp(rumps.App):
     def _start_monitoring(self):
         """Start audio monitoring."""
         try:
-            # Use the appropriate capture method
-            if self.use_system_audio:
-                # System audio capture
-                success = self.system_capture.start()
-                if not success:
-                    raise SystemAudioCaptureError("Failed to start system audio capture")
-            else:
-                # Microphone capture
-                self.audio_capture.start()
+            # Start microphone (or loopback) capture
+            self.audio_capture.start()
             
             self.is_monitoring = True
             
             # Update UI
-            source_name = "System Audio" if self.use_system_audio else "Microphone"
-            self.title = "🎵📊"
+            source_name = "Microphone"
+            self.title = "♪📊"
             self.toggle_item.title = "Stop Monitoring"
-            self.status_item.title = f"🎵 Monitoring {source_name}..."
+            self.status_item.title = f"♪ Monitoring {source_name}..."
             
-            # Start update timer
+            # Start update timer for live updates
             self._start_update_timer()
             
             if config.debug:
                 print(f"Audio monitoring started ({source_name})")
                 
-        except (AudioCaptureError, SystemAudioCaptureError) as e:
+        except (AudioCaptureError) as e:
             self._show_notification("Audio Error", str(e))
             if config.debug:
                 print(f"Failed to start monitoring: {e}")
@@ -304,12 +275,11 @@ class MusicBarApp(rumps.App):
         """Stop audio monitoring."""
         # Stop both capture methods
         self.audio_capture.stop()
-        self.system_capture.stop()
         
         self.is_monitoring = False
         
         # Update UI
-        self.title = "🎵"
+        self.title = "♪"
         self.toggle_item.title = "Start Monitoring"
         self.status_item.title = "🔇 Not monitoring"
         
@@ -327,47 +297,59 @@ class MusicBarApp(rumps.App):
     def _start_update_timer(self):
         """Start the UI update timer."""
         self._stop_update_timer()  # Ensure no duplicate timers
+        
+        if config.debug:
+            print(f"Starting update timer with interval: {config.ui.update_interval}")
+        
         self._update_timer = rumps.Timer(
-            self._update_display,
+            self._refresh_display,
             config.ui.update_interval
         )
         self._update_timer.start()
+        
+        if config.debug:
+            print("✅ Update timer started")
     
     def _stop_update_timer(self):
         """Stop the UI update timer."""
         if self._update_timer:
+            if config.debug:
+                print("Stopping update timer")
             self._update_timer.stop()
             self._update_timer = None
     
-    def _update_display(self, timer):
-        """Update the menu display with current audio metrics."""
+    def _refresh_display(self, sender=None):
+        """Refresh the display with current audio metrics - can be called by timer or manually."""
         if not self.is_monitoring:
             return
         
         try:
+            # Get current metrics
             metrics = self.audio_monitor.get_metrics()
             volume_db = self.audio_monitor.get_volume_db()
             stereo_info = self.audio_monitor.get_stereo_info()
             
             # Update volume display
             if metrics.overall_volume > 0.001:  # Avoid showing tiny values
-                self.volume_item.title = f"Volume: {volume_db['overall_db']:.1f}dB"
+                volume_text = f"Volume: {volume_db['overall_db']:.1f}dB"
+                if config.debug and sender is None:  # Only debug on timer calls, not manual
+                    print(f"Volume: {volume_db['overall_db']:.1f}dB")
                 
                 # Update title icon based on volume level
                 if volume_db['overall_db'] > -10:
-                    self.title = "🎵🔊"
+                    new_title = "♪🔊"
                 elif volume_db['overall_db'] > -20:
-                    self.title = "🎵🔉"
+                    new_title = "♪🔉"
                 elif volume_db['overall_db'] > -40:
-                    self.title = "🎵🔈"
+                    new_title = "♪🔈"
                 else:
-                    self.title = "🎵📊"
+                    new_title = "♪📊"
             else:
-                self.volume_item.title = "Volume: Silence"
-                self.title = "🎵📊"
+                volume_text = "Volume: Silence"
+                new_title = "♪📊"
             
             # Update stereo display
-            self.stereo_item.title = (
+            stereo_text = (
                 f"Stereo: {stereo_info['balance_description']} "
                 f"({stereo_info['width_description']})"
             )
@@ -378,13 +360,21 @@ class MusicBarApp(rumps.App):
                     freq_str = f"{metrics.peak_frequency:.0f}Hz"
                 else:
                     freq_str = f"{metrics.peak_frequency/1000:.1f}kHz"
-                self.frequency_item.title = f"Peak Freq: {freq_str}"
+                freq_text = f"Peak Freq: {freq_str}"
             else:
-                self.frequency_item.title = "Peak Freq: --"
-                
+                freq_text = "Peak Freq: --"
+            
+            # Apply all updates at once
+            self.volume_item.title = volume_text
+            self.stereo_item.title = stereo_text
+            self.frequency_item.title = freq_text
+            self.title = new_title
+            
         except Exception as e:
             if config.debug:
-                print(f"Error updating display: {e}")
+                print(f"Error refreshing display: {e}")
+                import traceback
+                traceback.print_exc()
     
     def _on_audio_update(self, metrics: AudioMetrics):
         """Called when new audio metrics are available."""
@@ -400,7 +390,6 @@ class MusicBarApp(rumps.App):
             "for macOS menu bar.\n\n"
             "Features:\n"
             "• Microphone input monitoring\n"
-            "• System audio capture (with Screen Recording permission)\n"
             "• Real-time volume and stereo analysis\n"
             "• Frequency domain analysis\n\n"
             "© 2024 MusicBar Project"
@@ -431,7 +420,7 @@ def run_app():
     try:
         app = MusicBarApp()
         if config.debug:
-            print("🎵 MusicBar starting... Look for the 🎵 icon in your menu bar!")
+            print("♪ MusicBar starting... Look for the ♪ icon in your menu bar!")
         app.run()
     except KeyboardInterrupt:
         if config.debug:

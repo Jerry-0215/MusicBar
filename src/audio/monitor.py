@@ -6,7 +6,7 @@ import threading
 from collections import deque
 from typing import Dict, Any, Optional, Callable
 from dataclasses import dataclass, field
-from ..utils.config import config
+from utils.config import config
 
 @dataclass
 class AudioMetrics:

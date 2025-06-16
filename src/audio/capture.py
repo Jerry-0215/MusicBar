@@ -5,8 +5,9 @@ import sounddevice as sd
 import numpy as np
 import threading
 import time
-from typing import Callable, Optional, Any
-from ..utils.config import config
+from typing import Callable, List, Dict, Optional, Any
+from dataclasses import dataclass
+from utils.config import config
 
 class AudioCaptureError(Exception):
     """Custom exception for audio capture errors."""

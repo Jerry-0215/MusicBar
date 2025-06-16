@@ -17,7 +17,7 @@ class AudioConfig:
 @dataclass
 class UIConfig:
     """User interface configuration."""
-    update_interval: float = 0.1  # Update frequency in seconds
+    update_interval: float = 0.2  # Update frequency in seconds (5 times per second)
     volume_history_length: int = 100  # Number of volume samples to keep
     show_notifications: bool = True
     
@@ -26,7 +26,7 @@ class AppConfig:
     """Main application configuration."""
     app_name: str = "MusicBar"
     version: str = "0.1.0"
-    debug: bool = False
+    debug: bool = True  # Enable debug for troubleshooting
     audio: AudioConfig = field(default_factory=AudioConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     
