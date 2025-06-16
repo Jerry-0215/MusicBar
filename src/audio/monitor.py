@@ -7,6 +7,8 @@ from collections import deque
 from typing import Dict, Any, Optional, Callable
 from dataclasses import dataclass, field
 from utils.config import config
+import librosa
+import copy
 
 @dataclass
 class AudioMetrics:
@@ -23,6 +25,11 @@ class AudioMetrics:
     # Basic frequency info
     peak_frequency: float = 0.0
     spectral_centroid: float = 0.0
+    frequency_history: deque = field(default_factory=lambda: deque(maxlen=25))
+    
+    # Musical features
+    bpm: float = 0.0
+    chord: str = "--"
     
     # Timing
     timestamp: float = 0.0
@@ -43,6 +50,8 @@ class AudioMetrics:
 class AudioMonitor:
     """Real-time audio analysis and monitoring."""
     
+    _chord_templates: Dict[str, np.ndarray] = {}
+
     def __init__(self, update_callback: Optional[Callable[[AudioMetrics], None]] = None):
         """
         Initialize audio monitor.
@@ -58,9 +67,37 @@ class AudioMonitor:
         self.sample_rate = config.audio.sample_rate
         self.channels = config.audio.channels
         
+        # Buffer for musical analysis
+        self.analysis_buffer_size = self.sample_rate * 5  # 5 seconds
+        self.analysis_buffer = np.array([], dtype=np.float32)
+
+        if not AudioMonitor._chord_templates:
+            AudioMonitor._chord_templates = self._create_chord_templates()
+
         if config.debug:
             print("AudioMonitor initialized")
     
+    @staticmethod
+    def _create_chord_templates() -> Dict[str, np.ndarray]:
+        """Create a dictionary of ideal chroma vectors for major/minor chords."""
+        templates = {}
+        pitch_classes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+        for i in range(12):
+            # Major chord: root, major third, perfect fifth
+            major_template = np.zeros(12)
+            major_template[i] = 1.0  # Root
+            major_template[(i + 4) % 12] = 0.8  # Major Third
+            major_template[(i + 7) % 12] = 0.9  # Fifth
+            templates[f"{pitch_classes[i]} Major"] = major_template / (np.linalg.norm(major_template) + 1e-9)
+            
+            # Minor chord: root, minor third, perfect fifth
+            minor_template = np.zeros(12)
+            minor_template[i] = 1.0  # Root
+            minor_template[(i + 3) % 12] = 0.8  # Minor Third
+            minor_template[(i + 7) % 12] = 0.9  # Fifth
+            templates[f"{pitch_classes[i]} Minor"] = minor_template / (np.linalg.norm(minor_template) + 1e-9)
+        return templates
+
     def process_audio(self, audio_data: np.ndarray, frames: int):
         """
         Process incoming audio data and update metrics.
@@ -93,6 +130,19 @@ class AudioMonitor:
                 
                 # Calculate basic frequency metrics
                 self._calculate_frequency_metrics(audio_data)
+
+                # Update analysis buffer
+                mono_signal = audio_data.mean(axis=1)
+                self.analysis_buffer = np.concatenate((self.analysis_buffer, mono_signal))
+                if len(self.analysis_buffer) > self.analysis_buffer_size:
+                    self.analysis_buffer = self.analysis_buffer[-self.analysis_buffer_size:]
+
+                # Calculate musical features if buffer is sufficiently full
+                if len(self.analysis_buffer) >= self.sample_rate * 2:  # Need at least 2s of audio
+                    self._calculate_musical_features(mono_signal=self.analysis_buffer)
+                else:
+                    self.metrics.bpm = 0.0
+                    self.metrics.chord = "--"
                 
                 # Update timestamp
                 import time
@@ -143,7 +193,11 @@ class AudioMonitor:
             # Find peak frequency
             peak_idx = np.argmax(magnitude)
             freqs = np.fft.rfftfreq(len(mono_signal), 1/self.sample_rate)
-            self.metrics.peak_frequency = float(freqs[peak_idx])
+            peak_freq = float(freqs[peak_idx])
+            self.metrics.peak_frequency = peak_freq
+            # Only add meaningful frequencies to the history
+            if peak_freq > 1.0:
+                self.metrics.frequency_history.append(peak_freq)
             
             # Calculate spectral centroid (brightness)
             if np.sum(magnitude) > 0:
@@ -159,10 +213,51 @@ class AudioMonitor:
             self.metrics.peak_frequency = 0.0
             self.metrics.spectral_centroid = 0.0
     
+    def _calculate_musical_features(self, mono_signal: np.ndarray):
+        """Calculate musical features like BPM and chord from a larger buffer."""
+        try:
+            # --- BPM Detection ---
+            tempo, _ = librosa.beat.beat_track(y=mono_signal, sr=self.sample_rate)
+            if tempo > 0:
+                self.metrics.bpm = float(tempo)
+            else:
+                self.metrics.bpm = 0.0
+
+            # --- Chord Detection ---
+            chroma = librosa.feature.chroma_stft(y=mono_signal, sr=self.sample_rate)
+            chroma_mean = np.mean(chroma, axis=1)
+
+            # Avoid division by zero if audio is silent
+            if np.sum(chroma_mean) > 0:
+                chroma_normalized = chroma_mean / np.linalg.norm(chroma_mean)
+            else:
+                self.metrics.chord = "--"
+                return
+
+            best_match_score = -1
+            best_match_chord = "--"
+            for chord_name, template_normalized in self._chord_templates.items():
+                score = np.dot(chroma_normalized, template_normalized) # Cosine similarity
+                if score > best_match_score:
+                    best_match_score = score
+                    best_match_chord = chord_name
+            
+            if config.debug:
+                print(f"Chord detection: Best match '{best_match_chord}' with score {best_match_score:.2f}")
+            
+            self.metrics.chord = best_match_chord
+
+        except Exception as e:
+            if config.debug:
+                print(f"Error calculating musical features: {e}")
+            self.metrics.bpm = 0.0
+            self.metrics.chord = "--"
+    
     def get_metrics(self) -> AudioMetrics:
         """Get current audio metrics (thread-safe)."""
         with self._lock:
-            return self.metrics
+            # Return a copy to ensure thread safety for the caller
+            return copy.copy(self.metrics)
     
     def get_volume_db(self) -> Dict[str, float]:
         """Get volume levels in dB."""

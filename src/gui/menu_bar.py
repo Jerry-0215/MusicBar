@@ -13,6 +13,7 @@ import objc
 import Foundation
 import CoreFoundation
 import AppKit
+import numpy as np
 
 # A dedicated controller for the NSTimer to avoid conflicts with rumps' object lifecycle.
 class UITimer(AppKit.NSObject):
@@ -119,11 +120,15 @@ class MusicBarApp(rumps.App):
         
         self.volume_item = rumps.MenuItem("Volume: --", callback=noop)
         self.stereo_item = rumps.MenuItem("Stereo: --", callback=noop)
-        self.frequency_item = rumps.MenuItem("Peak Freq: --", callback=noop)
+        self.frequency_item = rumps.MenuItem("Freq Range: --", callback=noop)
+        self.bpm_item = rumps.MenuItem("BPM: --", callback=noop)
+        self.chord_item = rumps.MenuItem("Chord: --", callback=noop)
         
         self.menu.add(self.volume_item)
         self.menu.add(self.stereo_item)
         self.menu.add(self.frequency_item)
+        self.menu.add(self.bpm_item)
+        self.menu.add(self.chord_item)
         self.menu.add(rumps.separator)
         
         # Controls section
@@ -340,7 +345,9 @@ class MusicBarApp(rumps.App):
         # Reset display
         self.volume_item.title = "Volume: --"
         self.stereo_item.title = "Stereo: --"
-        self.frequency_item.title = "Peak Freq: --"
+        self.frequency_item.title = "Freq Range: --"
+        self.bpm_item.title = "BPM: --"
+        self.chord_item.title = "Chord: --"
         
         # Stop update timer
         self._ui_timer.stop()
@@ -359,21 +366,24 @@ class MusicBarApp(rumps.App):
         try:
             # Get current metrics
             metrics = self.audio_monitor.get_metrics()
-            volume_db = self.audio_monitor.get_volume_db()
-            stereo_info = self.audio_monitor.get_stereo_info()
             
-            # Update volume display
-            if metrics.overall_volume > 0.001:  # Avoid showing tiny values
-                volume_text = f"Volume: {volume_db['overall_db']:.1f}dB"
-                if config.debug:
-                    print(f"Volume: {volume_db['overall_db']:.1f}dB")
+            # --- Smoothed Volume Display ---
+            # Use the average of recent volume history to provide a more stable reading.
+            if metrics.volume_history and len(metrics.volume_history) > 0:
+                avg_volume = np.mean(list(metrics.volume_history))
+            else:
+                avg_volume = 0.0
+
+            if avg_volume > 0.001:  # Avoid showing tiny values
+                volume_db_val = 20 * np.log10(avg_volume)
+                volume_text = f"Volume: {volume_db_val:.1f}dB"
                 
                 # Update title icon based on volume level
-                if volume_db['overall_db'] > -10:
+                if volume_db_val > -10:
                     new_title = "♪🔊"
-                elif volume_db['overall_db'] > -20:
+                elif volume_db_val > -20:
                     new_title = "♪🔉"
-                elif volume_db['overall_db'] > -40:
+                elif volume_db_val > -40:
                     new_title = "♪🔈"
                 else:
                     new_title = "♪📊"
@@ -382,25 +392,30 @@ class MusicBarApp(rumps.App):
                 new_title = "♪📊"
             
             # Update stereo display
+            stereo_info = self.audio_monitor.get_stereo_info()
             stereo_text = (
                 f"Stereo: {stereo_info['balance_description']} "
                 f"({stereo_info['width_description']})"
             )
             
             # Update frequency display
-            if metrics.peak_frequency > 0:
-                if metrics.peak_frequency < 1000:
-                    freq_str = f"{metrics.peak_frequency:.0f}Hz"
-                else:
-                    freq_str = f"{metrics.peak_frequency/1000:.1f}kHz"
-                freq_text = f"Peak Freq: {freq_str}"
+            if metrics.frequency_history and len(metrics.frequency_history) > 1:
+                min_freq = min(metrics.frequency_history)
+                max_freq = max(metrics.frequency_history)
+                freq_text = f"Freq Range: {min_freq:.0f}Hz - {max_freq:.0f}Hz"
             else:
-                freq_text = "Peak Freq: --"
+                freq_text = "Freq Range: --"
+            
+            # Update musical features display
+            bpm_text = f"BPM: {metrics.bpm:.1f}" if metrics.bpm > 0 else "BPM: --"
+            chord_text = f"Chord: {metrics.chord}"
             
             # Since this runs on the main thread, we can update UI directly.
             self.volume_item.title = volume_text
             self.stereo_item.title = stereo_text
             self.frequency_item.title = freq_text
+            self.bpm_item.title = bpm_text
+            self.chord_item.title = chord_text
             self.title = new_title
 
             # Explicitly update the menu to force a redraw while it's open.

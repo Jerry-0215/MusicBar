@@ -6,9 +6,9 @@ matplotlib>=3.5.0         # Basic visualization
 pyobjc-framework-Cocoa>=9.0  # macOS system integration
 pyobjc-framework-AVFoundation>=9.0  # Audio system access
 pyobjc-framework-Quartz>=9.0  # Screen Recording permission
-pyobjc-framework-AppKit>=9.0  # GUI and alerts
+pyobjc-framework-AppKit  # GUI and alerts
 
 # Optional future dependencies (commented out for now)
-# librosa>=0.10.0         # Advanced audio analysis (for Phase 2)
+librosa>=0.10.0         # Advanced audio analysis (for Phase 2)
 # essentia>=2.1b6         # Music information retrieval (for Phase 3)
 # pyacoustid>=1.3.0       # Song recognition (for Phase 3) 
