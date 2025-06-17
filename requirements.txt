@@ -9,6 +9,6 @@ pyobjc-framework-Quartz>=9.0  # Screen Recording permission
 pyobjc-framework-AppKit  # GUI and alerts
 
 # Optional future dependencies (commented out for now)
-librosa>=0.10.0         # Advanced audio analysis (for Phase 2)
-# essentia>=2.1b6         # Music information retrieval (for Phase 3)
+# librosa>=0.10.0         # Advanced audio analysis (for Phase 2)
+essentia>=2.1b6         # Music information retrieval (for Phase 3)
 # pyacoustid>=1.3.0       # Song recognition (for Phase 3) 

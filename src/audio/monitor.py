@@ -1,5 +1,5 @@
 """
-Audio monitoring and analysis module.
+Audio monitoring and analysis module using Essentia.
 """
 import numpy as np
 import threading
@@ -7,258 +7,230 @@ from collections import deque
 from typing import Dict, Any, Optional, Callable
 from dataclasses import dataclass, field
 from utils.config import config
-import librosa
-import copy
+import time
+
+# Essentia imports
+import essentia
+import essentia.standard as es
 
 @dataclass
 class AudioMetrics:
-    """Container for real-time audio metrics."""
-    # Volume metrics
-    overall_volume: float = 0.0
-    left_volume: float = 0.0
-    right_volume: float = 0.0
-    
-    # Stereo metrics
-    stereo_width: float = 0.0  # How "wide" the stereo field is
-    stereo_balance: float = 0.0  # -1.0 (left) to +1.0 (right)
-    
-    # Basic frequency info
-    peak_frequency: float = 0.0
-    spectral_centroid: float = 0.0
-    frequency_history: deque = field(default_factory=lambda: deque(maxlen=25))
-    
-    # Musical features
+    """Dataclass to hold all calculated audio metrics."""
+    volume_history: deque = field(default_factory=lambda: deque(maxlen=config.ui.volume_history_size))
+    stereo_balance: float = 0.0
+    stereo_width: float = 0.0
     bpm: float = 0.0
-    chord: str = "--"
+    chord: str = "N/A"
+    confidence: float = 0.0
     
-    # Timing
-    timestamp: float = 0.0
-    
-    # Volume history for visualization
-    volume_history: deque = field(default_factory=lambda: deque(maxlen=100))
-    
-    def __post_init__(self):
-        """Initialize with proper config values after creation."""
-        # Update maxlen if config is available
-        try:
-            # Replace with properly configured deque
-            self.volume_history = deque(maxlen=config.ui.volume_history_length)
-        except:
-            # Fallback to default if config not available
-            pass
+    def copy(self):
+        return AudioMetrics(
+            volume_history=self.volume_history.copy(),
+            stereo_balance=self.stereo_balance,
+            stereo_width=self.stereo_width,
+            bpm=self.bpm,
+            chord=self.chord,
+            confidence=self.confidence,
+        )
 
 class AudioMonitor:
-    """Real-time audio analysis and monitoring."""
-    
+    """
+    Analyzes audio data in real-time using Essentia to extract musical features.
+    """
     _chord_templates: Dict[str, np.ndarray] = {}
-
-    def __init__(self, update_callback: Optional[Callable[[AudioMetrics], None]] = None):
-        """
-        Initialize audio monitor.
-        
-        Args:
-            update_callback: Function to call when metrics are updated
-        """
-        self.update_callback = update_callback
-        self.metrics = AudioMetrics()
-        self._lock = threading.Lock()
-        
-        # Configuration
+    
+    def __init__(self, update_callback=None):
         self.sample_rate = config.audio.sample_rate
         self.channels = config.audio.channels
+        self.update_callback = update_callback
         
-        # Buffer for musical analysis
-        self.analysis_buffer_size = self.sample_rate * 5  # 5 seconds
-        self.analysis_buffer = np.array([], dtype=np.float32)
+        self._lock = threading.Lock()
+        self._metrics = AudioMetrics()
+        
+        # Buffer for analysis that requires a longer context
+        buffer_size_seconds = config.audio.analysis_buffer_size
+        self.analysis_buffer_len = int(buffer_size_seconds * self.sample_rate)
+        self._analysis_buffer = np.array([], dtype=np.float32)
+        
+        # Essentia Algorithms
+        self.frame_size = 4096 # Larger frame for better freq resolution
+        self.hop_size = 2048
+        
+        # More robust BPM estimator
+        self.rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
+        
+        # Algorithms for chromagram-based chord detection
+        self.window = es.Windowing(type='hann')
+        self.spectrum = es.Spectrum()
+        self.spectral_peaks = es.SpectralPeaks(
+            magnitudeThreshold=0.00001,
+            minFrequency=20,
+            maxFrequency=3500,
+            maxPeaks=60
+        )
+        self.hpcp = es.HPCP()
 
         if not AudioMonitor._chord_templates:
             AudioMonitor._chord_templates = self._create_chord_templates()
 
+        self.last_analysis_time = 0
+        self.analysis_interval = config.audio.analysis_interval
+
         if config.debug:
-            print("AudioMonitor initialized")
-    
+            print("AudioMonitor (Essentia) initialized with new algorithms")
+
     @staticmethod
     def _create_chord_templates() -> Dict[str, np.ndarray]:
         """Create a dictionary of ideal chroma vectors for major/minor chords."""
         templates = {}
         pitch_classes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
         for i in range(12):
-            # Major chord: root, major third, perfect fifth
             major_template = np.zeros(12)
-            major_template[i] = 1.0  # Root
-            major_template[(i + 4) % 12] = 0.8  # Major Third
-            major_template[(i + 7) % 12] = 0.9  # Fifth
-            templates[f"{pitch_classes[i]} Major"] = major_template / (np.linalg.norm(major_template) + 1e-9)
+            major_template[i] = 1.0
+            major_template[(i + 4) % 12] = 0.8
+            major_template[(i + 7) % 12] = 0.9
+            templates[f"{pitch_classes[i]} Major"] = major_template / (np.linalg.norm(major_template) or 1e-9)
             
-            # Minor chord: root, minor third, perfect fifth
             minor_template = np.zeros(12)
-            minor_template[i] = 1.0  # Root
-            minor_template[(i + 3) % 12] = 0.8  # Minor Third
-            minor_template[(i + 7) % 12] = 0.9  # Fifth
-            templates[f"{pitch_classes[i]} Minor"] = minor_template / (np.linalg.norm(minor_template) + 1e-9)
+            minor_template[i] = 1.0
+            minor_template[(i + 3) % 12] = 0.8
+            minor_template[(i + 7) % 12] = 0.9
+            templates[f"{pitch_classes[i]} Minor"] = minor_template / (np.linalg.norm(minor_template) or 1e-9)
         return templates
 
     def process_audio(self, audio_data: np.ndarray, frames: int):
         """
-        Process incoming audio data and update metrics.
-        
-        Args:
-            audio_data: Audio samples as numpy array (frames, channels)
-            frames: Number of audio frames
+        Callback to receive audio data from the capture source.
         """
-        with self._lock:
-            try:
-                # Ensure we have stereo data
-                if audio_data.ndim == 1:
-                    # Mono to stereo
-                    audio_data = np.column_stack([audio_data, audio_data])
-                elif audio_data.shape[1] == 1:
-                    # Mono to stereo
-                    audio_data = np.column_stack([audio_data[:, 0], audio_data[:, 0]])
-                
-                # Extract left and right channels
-                left_channel = audio_data[:, 0]
-                right_channel = audio_data[:, 1]
-                
-                # Calculate volume metrics (RMS)
-                self.metrics.left_volume = float(np.sqrt(np.mean(left_channel**2)))
-                self.metrics.right_volume = float(np.sqrt(np.mean(right_channel**2)))
-                self.metrics.overall_volume = float(np.sqrt(np.mean(audio_data**2)))
-                
-                # Calculate stereo metrics
-                self._calculate_stereo_metrics(left_channel, right_channel)
-                
-                # Calculate basic frequency metrics
-                self._calculate_frequency_metrics(audio_data)
-
-                # Update analysis buffer
-                mono_signal = audio_data.mean(axis=1)
-                self.analysis_buffer = np.concatenate((self.analysis_buffer, mono_signal))
-                if len(self.analysis_buffer) > self.analysis_buffer_size:
-                    self.analysis_buffer = self.analysis_buffer[-self.analysis_buffer_size:]
-
-                # Calculate musical features if buffer is sufficiently full
-                if len(self.analysis_buffer) >= self.sample_rate * 2:  # Need at least 2s of audio
-                    self._calculate_musical_features(mono_signal=self.analysis_buffer)
-                else:
-                    self.metrics.bpm = 0.0
-                    self.metrics.chord = "--"
-                
-                # Update timestamp
-                import time
-                self.metrics.timestamp = time.time()
-                
-                # Update volume history
-                self.metrics.volume_history.append(self.metrics.overall_volume)
-                
-                # Call update callback
-                if self.update_callback:
-                    self.update_callback(self.metrics)
-                
-            except Exception as e:
-                if config.debug:
-                    print(f"Error processing audio: {e}")
-    
-    def _calculate_stereo_metrics(self, left: np.ndarray, right: np.ndarray):
-        """Calculate stereo field metrics."""
-        # Stereo balance: difference between left and right
-        left_energy = np.mean(left**2)
-        right_energy = np.mean(right**2)
-        total_energy = left_energy + right_energy
-        
-        if total_energy > 0:
-            self.metrics.stereo_balance = float((right_energy - left_energy) / total_energy)
+        if self.channels == 2:
+            # Essentia algorithms work on mono. Average the channels.
+            mono_data = np.mean(audio_data, axis=1)
         else:
-            self.metrics.stereo_balance = 0.0
+            mono_data = audio_data
+
+        # Essentia expects float32
+        mono_data_float32 = mono_data.astype(np.float32)
+
+        # Append to analysis buffer
+        self._analysis_buffer = np.concatenate((self._analysis_buffer, mono_data_float32))
+        if len(self._analysis_buffer) > self.analysis_buffer_len:
+            self._analysis_buffer = self._analysis_buffer[-self.analysis_buffer_len:]
+
+        # --- Perform immediate analysis (low-latency metrics) ---
+        # Volume (RMS)
+        rms = np.sqrt(np.mean(mono_data_float32**2))
         
-        # Stereo width: correlation between channels (inverted)
-        # High correlation = narrow stereo field
-        # Low correlation = wide stereo field
+        # Stereo info (from original stereo data)
+        balance, width = 0.0, 0.0
+        if self.channels == 2:
+            left, right = audio_data[:, 0], audio_data[:, 1]
+            balance = np.mean(left) - np.mean(right)
+            width = np.mean(np.abs(left - right))
+
+        # --- Perform buffered analysis (high-latency metrics) ---
+        current_time = time.time()
+        if current_time - self.last_analysis_time > self.analysis_interval:
+            self.last_analysis_time = current_time
+            # Run analysis in a separate thread to not block the audio callback
+            threading.Thread(target=self._analyze_buffer).start()
+
+        # Update metrics atomically
+        with self._lock:
+            self._metrics.volume_history.append(rms)
+            self._metrics.stereo_balance = balance
+            self._metrics.stereo_width = width
+            if self.update_callback:
+                self.update_callback(self._metrics.copy())
+
+    def _analyze_buffer(self):
+        """
+        Analyze the content of the buffer for features like BPM and chords.
+        This is called periodically, not on every audio chunk.
+        """
+        # Create a copy for analysis to avoid race conditions
+        with self._lock:
+            analysis_data = self._analysis_buffer.copy()
+
+        if len(analysis_data) < self.frame_size:
+            return # Not enough data
+
+        # --- BPM Detection ---
         try:
-            correlation = np.corrcoef(left, right)[0, 1]
-            if np.isnan(correlation):
-                correlation = 1.0
-            self.metrics.stereo_width = float(1.0 - abs(correlation))
-        except:
-            self.metrics.stereo_width = 0.0
-    
-    def _calculate_frequency_metrics(self, audio_data: np.ndarray):
-        """Calculate basic frequency domain metrics."""
-        try:
-            # Take FFT of the audio data
-            mono_signal = np.mean(audio_data, axis=1)  # Convert to mono
-            fft = np.fft.rfft(mono_signal)
-            magnitude = np.abs(fft)
-            
-            # Find peak frequency
-            peak_idx = np.argmax(magnitude)
-            freqs = np.fft.rfftfreq(len(mono_signal), 1/self.sample_rate)
-            peak_freq = float(freqs[peak_idx])
-            self.metrics.peak_frequency = peak_freq
-            # Only add meaningful frequencies to the history
-            if peak_freq > 1.0:
-                self.metrics.frequency_history.append(peak_freq)
-            
-            # Calculate spectral centroid (brightness)
-            if np.sum(magnitude) > 0:
-                self.metrics.spectral_centroid = float(
-                    np.sum(freqs * magnitude) / np.sum(magnitude)
-                )
-            else:
-                self.metrics.spectral_centroid = 0.0
-                
+            bpm_info = self.rhythm_extractor(analysis_data)
+            bpm = bpm_info[0]
         except Exception as e:
-            if config.debug:
-                print(f"Error calculating frequency metrics: {e}")
-            self.metrics.peak_frequency = 0.0
-            self.metrics.spectral_centroid = 0.0
-    
-    def _calculate_musical_features(self, mono_signal: np.ndarray):
-        """Calculate musical features like BPM and chord from a larger buffer."""
+            if config.debug: print(f"[Essentia] BPM detection failed: {e}")
+            bpm = 0.0
+            
+        # --- Chord Detection (Chromagram-based) ---
         try:
-            # --- BPM Detection ---
-            tempo, _ = librosa.beat.beat_track(y=mono_signal, sr=self.sample_rate)
-            if tempo > 0:
-                self.metrics.bpm = float(tempo)
-            else:
-                self.metrics.bpm = 0.0
+            chroma_frames = []
+            for frame in es.FrameGenerator(analysis_data, frameSize=self.frame_size, hopSize=self.hop_size, startFromZero=True):
+                freqs, magnitudes = self.spectral_peaks(self.spectrum(self.window(frame)))
+                if not len(freqs): continue
+                chroma_frames.append(self.hpcp(freqs, magnitudes))
+            
+            if not chroma_frames: raise Exception("No valid chroma frames")
 
-            # --- Chord Detection ---
-            chroma = librosa.feature.chroma_stft(y=mono_signal, sr=self.sample_rate)
-            chroma_mean = np.mean(chroma, axis=1)
-
-            # Avoid division by zero if audio is silent
-            if np.sum(chroma_mean) > 0:
-                chroma_normalized = chroma_mean / np.linalg.norm(chroma_mean)
-            else:
-                self.metrics.chord = "--"
-                return
+            chroma_mean = np.mean(chroma_frames, axis=0)
+            chroma_normalized = chroma_mean / (np.linalg.norm(chroma_mean) or 1e-9)
 
             best_match_score = -1
-            best_match_chord = "--"
-            for chord_name, template_normalized in self._chord_templates.items():
-                score = np.dot(chroma_normalized, template_normalized) # Cosine similarity
+            best_chord = "N/A"
+            for chord_name, template in self._chord_templates.items():
+                score = np.dot(chroma_normalized, template)
                 if score > best_match_score:
                     best_match_score = score
-                    best_match_chord = chord_name
+                    best_chord = chord_name
             
-            if config.debug:
-                print(f"Chord detection: Best match '{best_match_chord}' with score {best_match_score:.2f}")
-            
-            self.metrics.chord = best_match_chord
+            confidence = best_match_score
 
         except Exception as e:
-            if config.debug:
-                print(f"Error calculating musical features: {e}")
-            self.metrics.bpm = 0.0
-            self.metrics.chord = "--"
-    
-    def get_metrics(self) -> AudioMetrics:
-        """Get current audio metrics (thread-safe)."""
+            if config.debug: print(f"[Essentia] Chord detection failed: {e}")
+            best_chord, confidence = "N/A", 0.0
+
+        # Update metrics atomically
         with self._lock:
-            # Return a copy to ensure thread safety for the caller
-            return copy.copy(self.metrics)
-    
+            self._metrics.bpm = bpm
+            if confidence > config.audio.chord_confidence_threshold:
+                 self._metrics.chord = best_chord
+                 self._metrics.confidence = confidence
+            else:
+                 self._metrics.chord = "N/A"
+                 self._metrics.confidence = 0.0
+
+
+    def get_metrics(self) -> AudioMetrics:
+        """Get a thread-safe copy of the latest audio metrics."""
+        with self._lock:
+            return self._metrics.copy()
+            
+    def get_stereo_info(self) -> dict:
+        """
+        Provides descriptive information about the stereo image.
+        """
+        with self._lock:
+            balance = self._metrics.stereo_balance
+            width = self._metrics.stereo_width
+        
+        # Balance description
+        if abs(balance) < 0.01: balance_desc = "Center"
+        elif balance > 0: balance_desc = f"{(balance*100):.0f}% Right"
+        else: balance_desc = f"{(-balance*100):.0f}% Left"
+        
+        # Width description
+        if width < 0.1: width_desc = "Mono"
+        elif width < 0.5: width_desc = "Narrow"
+        elif width < 1.0: width_desc = "Stereo"
+        else: width_desc = "Wide"
+        
+        return {
+            "balance": balance,
+            "width": width,
+            "balance_description": balance_desc,
+            "width_description": width_desc
+        }
+
     def get_volume_db(self) -> Dict[str, float]:
         """Get volume levels in dB."""
         with self._lock:
@@ -269,38 +241,14 @@ class AudioMonitor:
                     return -60.0  # Silence threshold
             
             return {
-                "overall_db": linear_to_db(self.metrics.overall_volume),
-                "left_db": linear_to_db(self.metrics.left_volume),
-                "right_db": linear_to_db(self.metrics.right_volume)
-            }
-    
-    def get_stereo_info(self) -> Dict[str, Any]:
-        """Get detailed stereo field information."""
-        with self._lock:
-            balance_description = "Center"
-            if self.metrics.stereo_balance < -0.1:
-                balance_description = "Left"
-            elif self.metrics.stereo_balance > 0.1:
-                balance_description = "Right"
-            
-            width_description = "Narrow"
-            if self.metrics.stereo_width > 0.5:
-                width_description = "Wide"
-            elif self.metrics.stereo_width > 0.3:
-                width_description = "Medium"
-            
-            return {
-                "balance": self.metrics.stereo_balance,
-                "balance_description": balance_description,
-                "width": self.metrics.stereo_width,
-                "width_description": width_description,
-                "left_volume": self.metrics.left_volume,
-                "right_volume": self.metrics.right_volume
+                "overall_db": linear_to_db(self._metrics.volume_history[-1]),
+                "left_db": linear_to_db(self._metrics.volume_history[-1] / 2),
+                "right_db": linear_to_db(self._metrics.volume_history[-1] / 2)
             }
     
     def reset_metrics(self):
         """Reset all metrics to default values."""
         with self._lock:
-            self.metrics = AudioMetrics()
+            self._metrics = AudioMetrics()
             if config.debug:
                 print("Audio metrics reset") 

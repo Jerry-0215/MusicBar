@@ -1,489 +1,333 @@
 """
-Menu bar GUI for MusicBar app using rumps.
+Menu bar GUI for MusicBar app using pure AppKit.
+This approach replaces the `rumps` library for greater control and flexibility.
 """
-import rumps
-import threading
-import time
-from typing import Optional
+
+import AppKit
+import objc
+import numpy as np
+from PyObjCTools import AppHelper
+
 from audio.capture import AudioCapture, AudioCaptureError
 from audio.monitor import AudioMonitor, AudioMetrics
 from utils.config import config
-from PyObjCTools import AppHelper  # Legacy; keeping for fallback
-import objc
-import Foundation
-import CoreFoundation
-import AppKit
-import numpy as np
 
-# A dedicated controller for the NSTimer to avoid conflicts with rumps' object lifecycle.
 class UITimer(AppKit.NSObject):
-    _app: 'MusicBarApp' = objc.ivar()
-    _timer: Optional[AppKit.NSTimer] = objc.ivar()
+    """A dedicated controller for the NSTimer to avoid conflicts with object lifecycles."""
+    _controller: 'MusicBarController' = objc.ivar()
+    _timer: AppKit.NSTimer = objc.ivar()
 
     @objc.selector
-    def initWithApp_(self, app: 'MusicBarApp'):
+    def initWithController_(self, controller: 'MusicBarController'):
         self = objc.super(UITimer, self).init()
-        if self is None:
-            return None
-        self._app = app
+        if self is None: return None
+        self._controller = controller
         self._timer = None
         return self
 
     @objc.python_method
     def start(self, interval: float):
         self.stop()
-        if config.debug:
-            print(f"Starting UITimer with interval: {interval}")
         self._timer = AppKit.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
             interval, self, b'tick:', None, True
         )
         AppKit.NSRunLoop.currentRunLoop().addTimer_forMode_(
             self._timer, AppKit.NSRunLoopCommonModes
         )
+        if config.debug:
+            print(f"UITimer started for common modes with interval: {interval}")
 
     @objc.python_method
     def stop(self):
         if self._timer and self._timer.isValid():
-            if config.debug:
-                print("Stopping UITimer")
             self._timer.invalidate()
             self._timer = None
+            if config.debug:
+                print("UITimer stopped")
 
     @objc.selector
     def tick_(self, timer: AppKit.NSTimer):
-        if self._app:
-            self._app._refresh_display()
+        if self._controller:
+            self._controller.refresh_display()
 
 
-class MusicBarApp(rumps.App):
-    """Main menu bar application."""
-    
-    def __init__(self):
-        # Initialize rumps app
-        super(MusicBarApp, self).__init__(
-            name=config.app_name,
-            title="♪",  # White musical note for better visibility
-            quit_button=None  # We'll add our own quit
-        )
+class StereoImageView(AppKit.NSView):
+    """A custom view to visualize the stereo image."""
+    _balance = objc.ivar.double()
+    _width = objc.ivar.double()
+
+    def initWithFrame_(self, frame):
+        self = objc.super(StereoImageView, self).initWithFrame_(frame)
+        if self:
+            self._balance = 0.0
+            self._width = 0.0
+        return self
+
+    def drawRect_(self, dirtyRect):
+        AppKit.NSColor.clearColor().set()
+        AppKit.NSRectFill(self.bounds())
+
+        bounds_inset = self.bounds().insetBy_dx_dy_(10, 10)
         
-        # Initialize components
+        path = AppKit.NSBezierPath.bezierPathWithOvalInRect_(bounds_inset)
+        AppKit.NSColor.grayColor().set()
+        path.setLineWidth_(1)
+        path.stroke()
+
+        center_x = self.bounds().size.width / 2
+        center_y = self.bounds().size.height / 2
+        
+        radius = (bounds_inset.size.width / 2) * self._width
+        angle = (1.0 - self._balance) * (np.pi / 2)
+
+        dot_x = center_x + radius * np.cos(angle) - 5
+        dot_y = center_y + radius * np.sin(angle) - 5
+        
+        dot_rect = AppKit.NSMakeRect(dot_x, dot_y, 10, 10)
+        dot_path = AppKit.NSBezierPath.bezierPathWithOvalInRect_(dot_rect)
+        
+        AppKit.NSColor.whiteColor().set()
+        dot_path.fill()
+
+    @objc.python_method
+    def update_stereo_image(self, balance: float, width: float):
+        if self._balance != balance or self._width != width:
+            self._balance = balance
+            self._width = width
+            self.setNeedsDisplay_(True)
+
+class MusicBarController(AppKit.NSObject):
+    """Main controller for the application. Manages UI and audio components."""
+    
+    def init(self):
+        self = objc.super(MusicBarController, self).init()
+        if not self: return None
+
         self.audio_monitor = AudioMonitor(update_callback=self._on_audio_update)
         self.audio_capture = AudioCapture(callback=self.audio_monitor.process_audio)
-        
-        # Current capture mode
-        self.use_system_audio = False
-        self.current_capture = self.audio_capture
-        
-        # State management
         self.is_monitoring = False
-        self._ui_timer: UITimer = UITimer.alloc().initWithApp_(self)
         
-        # Menu items
-        self._setup_menu()
+        self.setup_status_item()
+        self.setup_menu()
+        self.setup_popover()
         
+        self._ui_timer = UITimer.alloc().initWithController_(self)
+        self.status_item.setMenu_(self.menu)
+
         if config.debug:
-            print("MusicBarApp initialized")
+            print("MusicBarController initialized")
+        return self
+
+    def setup_status_item(self):
+        self.status_item = AppKit.NSStatusBar.systemStatusBar().statusItemWithLength_(AppKit.NSVariableStatusItemLength)
+        button = self.status_item.button()
+        button.setTitle_("♪")
+        button.setAction_(b'togglePopover:')
+        button.setTarget_(self)
+
+    def setup_popover(self):
+        self.popover = AppKit.NSPopover.alloc().init()
+        self.popover.setBehavior_(AppKit.NSPopoverBehaviorTransient)
+        self.popover.setAnimates_(True)
         
-        # Force menu bar to show icon immediately
-        self._ensure_menu_bar_visible()
-    
-    def _ensure_menu_bar_visible(self):
-        """Ensure the menu bar icon is visible."""
-        try:
-            # Force update the menu bar
-            self.title = "♪"
-            # Try to force a refresh
-            try:
-                if AppKit.NSApp() is not None:
-                    AppKit.NSApp().activateIgnoringOtherApps_(True)
-            except Exception:
-                pass  # benign; icon will show once menu is clicked
-            if config.debug:
-                print("♪ Menu bar icon should now be visible")
-        except Exception as e:
-            if config.debug:
-                print(f"Error ensuring menu bar visibility: {e}")
-    
-    def _setup_menu(self):
-        """Set up the menu bar menu items."""
-        # Status section
-        self.status_item = rumps.MenuItem("🔇 Not monitoring")
-        self.menu.add(self.status_item)
-        self.menu.add(rumps.separator)
+        self.stereo_view = StereoImageView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 150, 150))
+        vc = AppKit.NSViewController.alloc().init()
+        vc.setView_(self.stereo_view)
+        self.popover.setContentViewController_(vc)
+
+    def setup_menu(self):
+        self.menu = AppKit.NSMenu.alloc().init()
+
+        noop_action = b'noop:'
+        self.status_item_menu = self.create_menu_item("🔇 Not monitoring", noop_action, target=self)
+        self.volume_item = self.create_menu_item("Volume: --", noop_action, target=self)
+        self.stereo_item = self.create_menu_item("Stereo: --", noop_action, target=self)
+        self.bpm_item = self.create_menu_item("BPM: --", noop_action, target=self)
+        self.chord_item = self.create_menu_item("Chord: --", noop_action, target=self)
+        self.toggle_item = self.create_menu_item("Start Monitoring", b'toggleMonitoring:', target=self)
         
-        # Audio metrics section - these will auto-update when monitoring
-        # NOTE: Disabled (greyed-out) NSMenuItems do not visually refresh their
-        # title while the menu is tracking.  To ensure the numbers change in
-        # real-time we keep them *enabled* but attach a no-op callback so the
-        # user can't accidentally trigger anything.
-        noop = lambda _: None  # harmless placeholder callback
+        self.device_menu = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Microphone Device", None, "")
+        self.device_submenu = AppKit.NSMenu.alloc().init()
+        self.device_menu.setSubmenu_(self.device_submenu)
+
+        self.menu.addItem_(self.status_item_menu)
+        self.menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        self.menu.addItem_(self.volume_item)
+        self.menu.addItem_(self.stereo_item)
+        self.menu.addItem_(self.bpm_item)
+        self.menu.addItem_(self.chord_item)
+        self.menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        self.menu.addItem_(self.toggle_item)
+        self.menu.addItem_(self.device_menu)
+        self.menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        self.menu.addItem_(self.create_menu_item(f"About {config.app_name}", b'showAbout:', target=self))
+        self.menu.addItem_(self.create_menu_item("Quit", b'quitApp:', 'q', target=self))
+
+        self.update_device_menu()
+
+    def create_menu_item(self, title, action=None, key='', target=None):
+        item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key)
+        if target:
+            item.setTarget_(target)
+        return item
+
+    def update_device_menu(self):
+        self.device_submenu.removeAllItems()
+        devices = AudioCapture.list_devices()
+        current_device_id = self.audio_capture.device
+
+        for device in devices:
+            title = f"{device['name']} ({device['channels']}ch)"
+            if device['id'] == current_device_id:
+                title = f"✓ {title}"
+            item = self.create_menu_item(title, b'selectDevice:', target=self)
+            item.setRepresentedObject_(device['id'])
+            self.device_submenu.addItem_(item)
+
+    @objc.selector
+    def selectDevice_(self, sender):
+        device_id = sender.representedObject()
+        if device_id == self.audio_capture.device: return
+
+        was_monitoring = self.is_monitoring
+        if was_monitoring: self.stop_monitoring()
         
-        self.volume_item = rumps.MenuItem("Volume: --", callback=noop)
-        self.stereo_item = rumps.MenuItem("Stereo: --", callback=noop)
-        self.frequency_item = rumps.MenuItem("Freq Range: --", callback=noop)
-        self.bpm_item = rumps.MenuItem("BPM: --", callback=noop)
-        self.chord_item = rumps.MenuItem("Chord: --", callback=noop)
+        config.audio.device = device_id
+        self.audio_capture = AudioCapture(callback=self.audio_monitor.process_audio)
         
-        self.menu.add(self.volume_item)
-        self.menu.add(self.stereo_item)
-        self.menu.add(self.frequency_item)
-        self.menu.add(self.bpm_item)
-        self.menu.add(self.chord_item)
-        self.menu.add(rumps.separator)
-        
-        # Controls section
-        self.toggle_item = rumps.MenuItem(
-            "Start Monitoring",
-            callback=self._toggle_monitoring
-        )
-        self.menu.add(self.toggle_item)
-        
-        # Audio source selection - initialize first
-        # (System audio capture removed, so no source selection needed)
-        
-        # Device selection (for microphone mode) - initialize first
-        self.device_menu = rumps.MenuItem("Microphone Device")
-        # Don't call _update_device_menu() here since it tries to clear()
-        # Instead, add initial placeholder
-        self.device_menu.add(rumps.MenuItem("Loading devices..."))
-        self.menu.add(self.device_menu)
-        
-        self.menu.add(rumps.separator)
-        
-        # Settings and info
-        self.settings_menu = rumps.MenuItem("Settings")
-        self.settings_menu.add(rumps.MenuItem(
-            f"Sample Rate: {config.audio.sample_rate}Hz",
-            callback=None
-        ))
-        self.settings_menu.add(rumps.MenuItem(
-            f"Channels: {config.audio.channels}",
-            callback=None
-        ))
-        self.settings_menu.add(rumps.MenuItem(
-            f"Buffer: {config.audio.chunk_size}",
-            callback=None
-        ))
-        self.menu.add(self.settings_menu)
-        
-        # About and quit
-        self.menu.add(rumps.MenuItem(
-            f"About {config.app_name} v{config.version}",
-            callback=self._show_about
-        ))
-        self.menu.add(rumps.MenuItem("Quit", callback=self._quit_app))
-        
-        # Now that menus are properly initialized, update the device menu
-        self._safe_update_device_menu()
-    
-    def _select_source(self, source_type: str):
-        """Select audio source type."""
-        try:
-            # Stop current monitoring
-            was_monitoring = self.is_monitoring
-            if self.is_monitoring:
-                self._stop_monitoring()
-            
-            # Update source
-            if source_type == "system":
-                self.use_system_audio = True
-                self.current_capture = self.audio_capture
-                self.device_menu.title = "System Audio Device"
-            else:
-                self.use_system_audio = False
-                self.current_capture = self.audio_capture
-                self.device_menu.title = "Microphone Device"
-            
-            # Update menu checkmarks
-            self._update_source_menu()
-            
-            # Restart monitoring if it was running
-            if was_monitoring:
-                self._start_monitoring()
-            
-            if config.debug:
-                print(f"Switched to {source_type} audio source")
-                
-        except Exception as e:
-            self._show_notification("Error", f"Failed to switch audio source: {e}")
-    
-    def _update_source_menu(self):
-        """Update the audio source selection menu."""
-        self.source_menu.clear()
-        
-        # Microphone option
-        mic_title = "✓ Microphone Input" if not self.use_system_audio else "Microphone Input"
-        self.source_menu.add(rumps.MenuItem(
-            mic_title,
-            callback=lambda sender: self._select_source("microphone")
-        ))
-        
-        # System audio option
-        sys_title = "✓ System Audio (Screen Recording)" if self.use_system_audio else "System Audio (Screen Recording)"
-        self.source_menu.add(rumps.MenuItem(
-            sys_title,
-            callback=lambda sender: self._select_source("system")
-        ))
-    
-    def _safe_update_device_menu(self):
-        """Safely update the device menu without clearing uninitialized menus."""
-        try:
-            # Only clear if the menu is properly initialized
-            if hasattr(self.device_menu, '_menu') and self.device_menu._menu is not None:
-                self.device_menu.clear()
-            else:
-                # Menu not fully initialized, just remove existing items manually
-                while len(self.device_menu._items) > 0:
-                    item = self.device_menu._items[0]
-                    self.device_menu.remove(item)
-            
-            # Microphone devices
-            devices = AudioCapture.list_devices()
-            current_device = self.audio_capture.get_device_info()
-            
-            if not devices:
-                self.device_menu.add(rumps.MenuItem("No devices found"))
-                return
-            
-            for device in devices:
-                device_name = f"{device['name']} ({device['channels']}ch)"
-                is_current = (
-                    current_device.get('name') == device['name'] 
-                    if 'name' in current_device else False
-                )
-                
-                if is_current:
-                    device_name = f"✓ {device_name}"
-                
-                item = rumps.MenuItem(
-                    device_name,
-                    callback=lambda sender, dev_id=device['id']: self._select_device(dev_id)
-                )
-                self.device_menu.add(item)
-                
-        except Exception as e:
-            if config.debug:
-                print(f"Error updating device menu: {e}")
-            # Add fallback message
-            self.device_menu.add(rumps.MenuItem("Device menu error"))
-    
-    def _update_device_menu(self):
-        """Update the audio device selection menu."""
-        # Use the safe version
-        self._safe_update_device_menu()
-    
-    def _select_device(self, device_id: int):
-        """Select a new audio device."""
-        try:
-            # Stop current monitoring
-            was_monitoring = self.is_monitoring
-            if self.is_monitoring:
-                self._stop_monitoring()
-            
-            # Update device configuration
-            config.audio.device = device_id
-            self.audio_capture = AudioCapture(callback=self.audio_monitor.process_audio)
-            self.current_capture = self.audio_capture
-            
-            # Restart monitoring if it was running
-            if was_monitoring:
-                self._start_monitoring()
-            
-            # Update menu
-            self._update_device_menu()
-            
-            if config.debug:
-                print(f"Switched to audio device: {device_id}")
-                
-        except Exception as e:
-            self._show_notification("Error", f"Failed to switch device: {e}")
-    
-    def _toggle_monitoring(self, sender):
-        """Toggle audio monitoring on/off."""
-        if self.is_monitoring:
-            self._stop_monitoring()
+        if was_monitoring: self.start_monitoring()
+        self.update_device_menu()
+
+    @objc.selector
+    def togglePopover_(self, sender):
+        if self.popover.isShown():
+            self.popover.close()
         else:
-            self._start_monitoring()
-    
-    def _start_monitoring(self):
-        """Start audio monitoring."""
-        try:
-            # Start microphone (or loopback) capture
-            self.audio_capture.start()
-            
-            self.is_monitoring = True
-            
-            # Update UI
-            source_name = "Microphone"
-            self.title = "♪📊"
-            self.toggle_item.title = "Stop Monitoring"
-            self.status_item.title = f"♪ Monitoring {source_name}..."
-            
-            # Start update timer for live updates
-            self._ui_timer.start(config.ui.update_interval)
-            
-            if config.debug:
-                print(f"Audio monitoring started ({source_name})")
-                
-        except (AudioCaptureError) as e:
-            self._show_notification("Audio Error", str(e))
-            if config.debug:
-                print(f"Failed to start monitoring: {e}")
-    
-    def _stop_monitoring(self):
-        """Stop audio monitoring."""
-        # Stop both capture methods
-        self.audio_capture.stop()
-        
-        self.is_monitoring = False
-        
-        # Update UI
-        self.title = "♪"
-        self.toggle_item.title = "Start Monitoring"
-        self.status_item.title = "🔇 Not monitoring"
-        
-        # Reset display
-        self.volume_item.title = "Volume: --"
-        self.stereo_item.title = "Stereo: --"
-        self.frequency_item.title = "Freq Range: --"
-        self.bpm_item.title = "BPM: --"
-        self.chord_item.title = "Chord: --"
-        
-        # Stop update timer
-        self._ui_timer.stop()
-        
-        if config.debug:
-            print("Audio monitoring stopped")
-    
-    @objc.python_method
-    def _refresh_display(self):
-        """Refresh the display with current audio metrics. Called by our UITimer."""
-        if config.debug:
-            print("--- _refresh_display called ---")
-        if not self.is_monitoring:
-            return
-        
-        try:
-            # Get current metrics
-            metrics = self.audio_monitor.get_metrics()
-            
-            # --- Smoothed Volume Display ---
-            # Use the average of recent volume history to provide a more stable reading.
-            if metrics.volume_history and len(metrics.volume_history) > 0:
-                avg_volume = np.mean(list(metrics.volume_history))
-            else:
-                avg_volume = 0.0
+            self.popover.showRelativeToRect_ofView_preferredEdge_(sender.bounds(), sender, AppKit.NSMinYEdge)
 
-            if avg_volume > 0.001:  # Avoid showing tiny values
-                volume_db_val = 20 * np.log10(avg_volume)
-                volume_text = f"Volume: {volume_db_val:.1f}dB"
-                
-                # Update title icon based on volume level
-                if volume_db_val > -10:
-                    new_title = "♪🔊"
-                elif volume_db_val > -20:
-                    new_title = "♪🔉"
-                elif volume_db_val > -40:
-                    new_title = "♪🔈"
-                else:
-                    new_title = "♪📊"
-            else:
-                volume_text = "Volume: Silence"
-                new_title = "♪📊"
-            
-            # Update stereo display
-            stereo_info = self.audio_monitor.get_stereo_info()
-            stereo_text = (
-                f"Stereo: {stereo_info['balance_description']} "
-                f"({stereo_info['width_description']})"
-            )
-            
-            # Update frequency display
-            if metrics.frequency_history and len(metrics.frequency_history) > 1:
-                min_freq = min(metrics.frequency_history)
-                max_freq = max(metrics.frequency_history)
-                freq_text = f"Freq Range: {min_freq:.0f}Hz - {max_freq:.0f}Hz"
-            else:
-                freq_text = "Freq Range: --"
-            
-            # Update musical features display
-            bpm_text = f"BPM: {metrics.bpm:.1f}" if metrics.bpm > 0 else "BPM: --"
-            chord_text = f"Chord: {metrics.chord}"
-            
-            # Since this runs on the main thread, we can update UI directly.
-            self.volume_item.title = volume_text
-            self.stereo_item.title = stereo_text
-            self.frequency_item.title = freq_text
-            self.bpm_item.title = bpm_text
-            self.chord_item.title = chord_text
-            self.title = new_title
-
-            # Explicitly update the menu to force a redraw while it's open.
-            if hasattr(self.menu, '_menu') and self.menu._menu is not None:
-                self.menu._menu.update()
-            
-        except Exception as e:
-            if config.debug:
-                print(f"Error refreshing display: {e}")
-                import traceback
-                traceback.print_exc()
-    
-    def _on_audio_update(self, metrics: AudioMetrics):
-        """Called when new audio metrics are available."""
-        # This is called from the audio thread, so we don't update UI directly
-        # The UI update timer handles the display updates
-        pass
-    
-    def _show_about(self, sender):
-        """Show about dialog."""
-        message = (
-            f"{config.app_name} v{config.version}\n\n"
-            "Real-time audio monitoring and visualization\n"
-            "for macOS menu bar.\n\n"
-            "Features:\n"
-            "• Microphone input monitoring\n"
-            "• Real-time volume and stereo analysis\n"
-            "• Frequency domain analysis\n\n"
-            "© 2024 MusicBar Project"
-        )
-        rumps.alert(
-            title=f"About {config.app_name}",
-            message=message,
-            ok="OK"
-        )
-    
-    def _show_notification(self, title: str, message: str):
-        """Show a system notification."""
-        if config.ui.show_notifications:
-            rumps.notification(
-                title=title,
-                subtitle=config.app_name,
-                message=message
-            )
-    
-    def _quit_app(self, sender):
-        """Quit the application."""
+    @objc.selector
+    def toggleMonitoring_(self, sender):
         if self.is_monitoring:
-            self._stop_monitoring()
-        rumps.quit_application()
+            self.stop_monitoring()
+        else:
+            self.start_monitoring()
+
+    @objc.python_method
+    def start_monitoring(self):
+        try:
+            self.audio_capture.start()
+            self.is_monitoring = True
+            self.toggle_item.setTitle_("Stop Monitoring")
+            self.status_item_menu.setTitle_(f"♪ Monitoring Microphone...")
+            self._ui_timer.start(config.ui.update_interval)
+            if config.debug: print("Audio monitoring started")
+        except AudioCaptureError as e:
+            self.show_alert("Audio Error", str(e))
+            if config.debug: print(f"Failed to start monitoring: {e}")
+
+    @objc.python_method
+    def stop_monitoring(self):
+        if not self.is_monitoring: return
+        self.audio_capture.stop()
+        self.is_monitoring = False
+        self._ui_timer.stop()
+        self.toggle_item.setTitle_("Start Monitoring")
+        self.status_item_menu.setTitle_("🔇 Not monitoring")
+        self.status_item.button().setTitle_("♪")
+        self.volume_item.setTitle_("Volume: --")
+        self.stereo_item.setTitle_("Stereo: --")
+        self.bpm_item.setTitle_("BPM: --")
+        self.chord_item.setTitle_("Chord: --")
+        if self.popover.isShown(): self.popover.close()
+        if config.debug: print("Audio monitoring stopped")
+
+    @objc.python_method
+    def refresh_display(self):
+        if not self.is_monitoring: return
+        try:
+            metrics = self.audio_monitor.get_metrics()
+            avg_volume = np.mean(list(metrics.volume_history)) if metrics.volume_history else 0.0
+
+            if avg_volume > 0.001:
+                volume_db_val = 20 * np.log10(avg_volume)
+                self.volume_item.setTitle_(f"Volume: {volume_db_val:.1f}dB")
+                if volume_db_val > -10: title = "♪🔊"
+                elif volume_db_val > -20: title = "♪🔉"
+                elif volume_db_val > -40: title = "♪🔈"
+                else: title = "♪📊"
+            else:
+                self.volume_item.setTitle_("Volume: Silence")
+                title = "♪📊"
+            self.status_item.button().setTitle_(title)
+
+            stereo_info = self.audio_monitor.get_stereo_info()
+            self.stereo_item.setTitle_(f"Stereo: {stereo_info['balance_description']} ({stereo_info['width_description']})")
+            
+            if self.stereo_view:
+                self.stereo_view.update_stereo_image(stereo_info.get('balance', 0.0), stereo_info.get('width', 0.0))
+
+            self.bpm_item.setTitle_(f"BPM: {metrics.bpm:.1f}" if metrics.bpm > 0 else "BPM: --")
+            self.chord_item.setTitle_(f"Chord: {metrics.chord}")
+
+        except Exception as e:
+            if config.debug: print(f"Error refreshing display: {e}")
+
+    @objc.python_method
+    def _on_audio_update(self, metrics: AudioMetrics):
+        pass # The UI timer handles all display updates
+
+    @objc.selector
+    def showAbout_(self, sender):
+        self.show_alert(f"About {config.app_name}", f"{config.app_name} v{config.version}")
+
+    @objc.python_method
+    def show_alert(self, title, message):
+        alert = AppKit.NSAlert.alloc().init()
+        alert.setMessageText_(title)
+        alert.setInformativeText_(message)
+        alert.setAlertStyle_(AppKit.NSAlertStyleInformational)
+        alert.runModal()
+        
+    @objc.selector
+    def quitApp_(self, sender):
+        self.stop_monitoring()
+        AppKit.NSApplication.sharedApplication().terminate_(None)
+
+    @objc.selector
+    def noop_(self, sender):
+        """A no-op action to ensure menu items are enabled and can be redrawn."""
+        pass
+
+class AppDelegate(AppKit.NSObject):
+    _controller: MusicBarController = objc.ivar()
+
+    def applicationDidFinishLaunching_(self, notification):
+        self._controller = MusicBarController.alloc().init()
+        if config.debug:
+            print("AppDelegate finished launching, controller created.")
+
+    def applicationWillTerminate_(self, notification):
+        if self._controller:
+            self._controller.stop_monitoring()
+        if config.debug:
+            print("Application will terminate.")
 
 def run_app():
     """Entry point to run the menu bar app."""
     try:
-        app = MusicBarApp()
-        if config.debug:
-            print("♪ MusicBar starting... Look for the ♪ icon in your menu bar!")
-        app.run()
+        if config.debug: print("Starting AppKit application...")
+        
+        app = AppKit.NSApplication.sharedApplication()
+        delegate = AppDelegate.alloc().init()
+        app.setDelegate_(delegate)
+        
+        AppHelper.runEventLoop()
+
     except KeyboardInterrupt:
-        if config.debug:
-            print("Application interrupted by user")
+        if config.debug: print("Application interrupted by user.")
     except Exception as e:
-        if config.debug:
-            print(f"Application error: {e}")
-            import traceback
-            traceback.print_exc()
-        else:
-            rumps.alert("Error", f"Application error: {e}")
+        if config.debug: print(f"Application error: {e}")
+        # Consider a native alert for the user here.
 
 if __name__ == "__main__":
     run_app() 

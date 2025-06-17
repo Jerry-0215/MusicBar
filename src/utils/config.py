@@ -14,12 +14,21 @@ class AudioConfig:
     device: Optional[int] = None  # None = default device
     dtype: str = 'float32'  # Audio data type
     
+    # Analysis buffer size in seconds
+    analysis_buffer_size: int = 5
+    
+    # How often to run heavy analysis (BPM, chords) in seconds
+    analysis_interval: float = 1.5
+    
+    # Confidence threshold for chord detection
+    chord_confidence_threshold: float = 0.4
+    
 @dataclass
 class UIConfig:
     """User interface configuration."""
-    update_interval: float = 0.2  # Update frequency in seconds (5 times per second)
-    volume_history_length: int = 100  # Number of volume samples to keep
+    update_interval: float = 0.2  # Update frequency in seconds
     show_notifications: bool = True
+    volume_history_size: int = 20
     
 @dataclass
 class AppConfig:
@@ -46,8 +55,6 @@ class AppConfig:
             config.audio.device = int(os.getenv('MUSICBAR_DEVICE'))
             
         # UI settings
-        if os.getenv('MUSICBAR_UPDATE_INTERVAL'):
-            config.ui.update_interval = float(os.getenv('MUSICBAR_UPDATE_INTERVAL'))
         if os.getenv('MUSICBAR_DEBUG'):
             config.debug = os.getenv('MUSICBAR_DEBUG').lower() == 'true'
             
