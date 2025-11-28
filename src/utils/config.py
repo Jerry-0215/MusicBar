@@ -10,23 +10,29 @@ class AudioConfig:
     """Audio capture and processing configuration."""
     sample_rate: int = 44100  # CD quality
     channels: int = 2  # Stereo
-    chunk_size: int = 1024  # Buffer size for real-time processing
+    chunk_size: int = 2048  # Buffer size for real-time processing
     device: Optional[int] = None  # None = default device
     dtype: str = 'float32'  # Audio data type
     
     # Analysis buffer size in seconds
     analysis_buffer_size: int = 5
     
-    # How often to run heavy analysis (BPM, chords) in seconds
-    analysis_interval: float = 1.5
+    # How often to run heavy analysis
+    bpm_analysis_interval: float = 2.0
+    chord_analysis_interval: float = 1.0
     
     # Confidence threshold for chord detection
     chord_confidence_threshold: float = 0.4
     
+    # Instrument detection settings
+    instrument_analysis_interval: float = 2.0  # How often to run instrument detection (need time to build buffer)
+    instrument_confidence_threshold: float = 0.2  # Minimum confidence for instrument detection
+    enable_instrument_detection: bool = True  # Enable/disable instrument detection
+    
 @dataclass
 class UIConfig:
     """User interface configuration."""
-    update_interval: float = 0.2  # Update frequency in seconds
+    update_interval: float = 0.1  # Update frequency in seconds
     show_notifications: bool = True
     volume_history_size: int = 20
     
@@ -35,7 +41,7 @@ class AppConfig:
     """Main application configuration."""
     app_name: str = "MusicBar"
     version: str = "0.1.0"
-    debug: bool = True  # Enable debug for troubleshooting
+    debug: bool = False  # Enable debug for troubleshooting
     audio: AudioConfig = field(default_factory=AudioConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     

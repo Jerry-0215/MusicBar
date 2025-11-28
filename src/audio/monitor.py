@@ -1,17 +1,19 @@
 """
 Audio monitoring and analysis module using Essentia.
 """
-import numpy as np
-import threading
-from collections import deque
-from typing import Dict, Any, Optional, Callable
-from dataclasses import dataclass, field
-from utils.config import config
 import time
+import threading
+import numpy as np
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Deque, Dict, Any, Optional, Callable
 
 # Essentia imports
 import essentia
 import essentia.standard as es
+
+from ..utils.config import config
+from .enhanced_classifier import EnhancedInstrumentClassifier
 
 @dataclass
 class AudioMetrics:
@@ -21,7 +23,10 @@ class AudioMetrics:
     stereo_width: float = 0.0
     bpm: float = 0.0
     chord: str = "N/A"
-    confidence: float = 0.0
+    chord_confidence: float = 0.0
+    instruments: list = field(default_factory=list)  # List of detected instruments with confidence
+    dominant_instrument: str = "N/A"
+    instrument_confidence: float = 0.0
     
     def copy(self):
         return AudioMetrics(
@@ -30,19 +35,31 @@ class AudioMetrics:
             stereo_width=self.stereo_width,
             bpm=self.bpm,
             chord=self.chord,
-            confidence=self.confidence,
+            chord_confidence=self.chord_confidence,
+            instruments=self.instruments.copy(),
+            dominant_instrument=self.dominant_instrument,
+            instrument_confidence=self.instrument_confidence,
         )
 
 class AudioMonitor:
     """
     Analyzes audio data in real-time using Essentia to extract musical features.
     """
-    _chord_templates: Dict[str, np.ndarray] = {}
-    
-    def __init__(self, update_callback=None):
+    _instance = None
+    _chord_templates = {}
+
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            cls._instance = super(AudioMonitor, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        # Prevent re-initialization
+        if hasattr(self, '_initialized') and self._initialized: return
+        self._initialized = True
+        
         self.sample_rate = config.audio.sample_rate
         self.channels = config.audio.channels
-        self.update_callback = update_callback
         
         self._lock = threading.Lock()
         self._metrics = AudioMetrics()
@@ -73,11 +90,26 @@ class AudioMonitor:
         if not AudioMonitor._chord_templates:
             AudioMonitor._chord_templates = self._create_chord_templates()
 
-        self.last_analysis_time = 0
-        self.analysis_interval = config.audio.analysis_interval
+        self.last_bpm_analysis_time = 0
+        self.last_chord_analysis_time = 0
+        self.last_instrument_analysis_time = 0
+        self.bpm_analysis_interval = config.audio.bpm_analysis_interval
+        self.chord_analysis_interval = config.audio.chord_analysis_interval
+        self.instrument_analysis_interval = config.audio.instrument_analysis_interval
+
+        # Instrument detection algorithms
+        self.mfcc = es.MFCC(numberCoefficients=13)
+        self.spectral_centroid = es.Centroid()
+        self.spectral_rolloff = es.RollOff()
+        self.spectral_complexity = es.SpectralComplexity()
+        self.zero_crossing_rate = es.ZeroCrossingRate()
+        self.rms_energy = es.RMS()
+        
+        # Enhanced instrument classifier with research-based profiles
+        self.instrument_classifier = EnhancedInstrumentClassifier()
 
         if config.debug:
-            print("AudioMonitor (Essentia) initialized with new algorithms")
+            print("AudioMonitor (Essentia) initialized with separate analysis intervals")
 
     @staticmethod
     def _create_chord_templates() -> Dict[str, np.ndarray]:
@@ -97,6 +129,7 @@ class AudioMonitor:
             minor_template[(i + 7) % 12] = 0.9
             templates[f"{pitch_classes[i]} Minor"] = minor_template / (np.linalg.norm(minor_template) or 1e-9)
         return templates
+
 
     def process_audio(self, audio_data: np.ndarray, frames: int):
         """
@@ -129,40 +162,52 @@ class AudioMonitor:
 
         # --- Perform buffered analysis (high-latency metrics) ---
         current_time = time.time()
-        if current_time - self.last_analysis_time > self.analysis_interval:
-            self.last_analysis_time = current_time
-            # Run analysis in a separate thread to not block the audio callback
-            threading.Thread(target=self._analyze_buffer).start()
+        
+        # Schedule BPM analysis
+        if current_time - self.last_bpm_analysis_time > self.bpm_analysis_interval:
+            self.last_bpm_analysis_time = current_time
+            threading.Thread(target=self._analyze_bpm).start()
+        
+        # Schedule Chord analysis
+        if current_time - self.last_chord_analysis_time > self.chord_analysis_interval:
+            self.last_chord_analysis_time = current_time
+            threading.Thread(target=self._analyze_chord).start()
+        
+        # Schedule Instrument analysis (if enabled)
+        if (config.audio.enable_instrument_detection and 
+            current_time - self.last_instrument_analysis_time > self.instrument_analysis_interval):
+            self.last_instrument_analysis_time = current_time
+            if config.debug:
+                print(f"[Instrument Debug] Starting instrument analysis, buffer size: {len(self._analysis_buffer)}")
+            threading.Thread(target=self._analyze_instruments).start()
 
-        # Update metrics atomically
         with self._lock:
             self._metrics.volume_history.append(rms)
             self._metrics.stereo_balance = balance
             self._metrics.stereo_width = width
-            if self.update_callback:
-                self.update_callback(self._metrics.copy())
 
-    def _analyze_buffer(self):
-        """
-        Analyze the content of the buffer for features like BPM and chords.
-        This is called periodically, not on every audio chunk.
-        """
-        # Create a copy for analysis to avoid race conditions
+    def _analyze_bpm(self):
+        """Analyze the buffer for BPM."""
         with self._lock:
             analysis_data = self._analysis_buffer.copy()
+        if len(analysis_data) < self.frame_size: return
 
-        if len(analysis_data) < self.frame_size:
-            return # Not enough data
-
-        # --- BPM Detection ---
         try:
             bpm_info = self.rhythm_extractor(analysis_data)
             bpm = bpm_info[0]
+            with self._lock:
+                self._metrics.bpm = bpm
         except Exception as e:
             if config.debug: print(f"[Essentia] BPM detection failed: {e}")
-            bpm = 0.0
-            
-        # --- Chord Detection (Chromagram-based) ---
+            with self._lock:
+                self._metrics.bpm = 0.0
+
+    def _analyze_chord(self):
+        """Analyze the buffer for Chords."""
+        with self._lock:
+            analysis_data = self._analysis_buffer.copy()
+        if len(analysis_data) < self.frame_size: return
+
         try:
             chroma_frames = []
             for frame in es.FrameGenerator(analysis_data, frameSize=self.frame_size, hopSize=self.hop_size, startFromZero=True):
@@ -185,20 +230,75 @@ class AudioMonitor:
             
             confidence = best_match_score
 
+            with self._lock:
+                if confidence > config.audio.chord_confidence_threshold:
+                     self._metrics.chord = best_chord
+                     self._metrics.chord_confidence = confidence
+                else:
+                     self._metrics.chord = "N/A"
+                     self._metrics.chord_confidence = 0.0
         except Exception as e:
             if config.debug: print(f"[Essentia] Chord detection failed: {e}")
-            best_chord, confidence = "N/A", 0.0
+            with self._lock:
+                self._metrics.chord = "N/A"
+                self._metrics.chord_confidence = 0.0
 
-        # Update metrics atomically
+    def _analyze_instruments(self):
+        """Analyze the buffer for instrument detection using professional librosa."""
         with self._lock:
-            self._metrics.bpm = bpm
-            if confidence > config.audio.chord_confidence_threshold:
-                 self._metrics.chord = best_chord
-                 self._metrics.confidence = confidence
-            else:
-                 self._metrics.chord = "N/A"
-                 self._metrics.confidence = 0.0
+            analysis_data = self._analysis_buffer.copy()
+        
+        if config.debug:
+            print(f"[Instrument Debug] Analysis data length: {len(analysis_data)}, frame_size: {self.frame_size}")
+        
+        # Require at least 0.1 seconds of audio for instrument detection
+        min_analysis_length = self.sample_rate // 10  # 0.1 second
+        if len(analysis_data) < min_analysis_length:
+            if config.debug:
+                print(f"[Instrument Debug] Not enough data for analysis: {len(analysis_data)} < {min_analysis_length}")
+            return
 
+        try:
+            # Use the professional instrument classifier
+            instrument_scores = self.instrument_classifier.classify_audio(analysis_data)
+            
+            # Debug output only when explicitly enabled
+            if config.debug:
+                print(f"[Professional Instrument Detection] All scores:")
+                for instrument_name, score in instrument_scores.items():
+                    print(f"  {instrument_name}: {score:.3f}")
+            
+            # Get top instruments above threshold
+            detected_instruments = []
+            for instrument_name, confidence in instrument_scores.items():
+                if confidence > config.audio.instrument_confidence_threshold:
+                    detected_instruments.append((instrument_name, confidence))
+            
+            # Sort by confidence
+            detected_instruments.sort(key=lambda x: x[1], reverse=True)
+            
+            if config.debug:
+                print(f"[Instrument Debug] Detected instruments above threshold {config.audio.instrument_confidence_threshold}: {detected_instruments}")
+            
+            # Update metrics
+            with self._lock:
+                self._metrics.instruments = detected_instruments
+                if detected_instruments:
+                    self._metrics.dominant_instrument = detected_instruments[0][0]
+                    self._metrics.instrument_confidence = detected_instruments[0][1]
+                else:
+                    self._metrics.dominant_instrument = "N/A"
+                    self._metrics.instrument_confidence = 0.0
+
+        except Exception as e:
+            if config.debug: 
+                print(f"[Professional] Instrument detection failed: {e}")
+                import traceback
+                traceback.print_exc()
+            with self._lock:
+                self._metrics.instruments = []
+                self._metrics.dominant_instrument = "N/A"
+                self._metrics.instrument_confidence = 0.0
 
     def get_metrics(self) -> AudioMetrics:
         """Get a thread-safe copy of the latest audio metrics."""
@@ -244,6 +344,16 @@ class AudioMonitor:
                 "overall_db": linear_to_db(self._metrics.volume_history[-1]),
                 "left_db": linear_to_db(self._metrics.volume_history[-1] / 2),
                 "right_db": linear_to_db(self._metrics.volume_history[-1] / 2)
+            }
+    
+    def get_instrument_info(self) -> dict:
+        """Get detailed instrument detection information."""
+        with self._lock:
+            return {
+                "dominant_instrument": self._metrics.dominant_instrument,
+                "instrument_confidence": self._metrics.instrument_confidence,
+                "all_instruments": self._metrics.instruments,
+                "detection_enabled": config.audio.enable_instrument_detection
             }
     
     def reset_metrics(self):

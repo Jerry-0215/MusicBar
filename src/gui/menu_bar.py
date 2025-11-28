@@ -7,10 +7,12 @@ import AppKit
 import objc
 import numpy as np
 from PyObjCTools import AppHelper
+from collections import deque
 
-from audio.capture import AudioCapture, AudioCaptureError
-from audio.monitor import AudioMonitor, AudioMetrics
-from utils.config import config
+from ..audio.capture import AudioCapture, AudioCaptureError
+from ..audio.monitor import AudioMonitor, AudioMetrics
+from ..utils.config import config
+from ..utils.main_thread import call_on_main_thread
 
 class UITimer(AppKit.NSObject):
     """A dedicated controller for the NSTimer to avoid conflicts with object lifecycles."""
@@ -103,7 +105,7 @@ class MusicBarController(AppKit.NSObject):
         self = objc.super(MusicBarController, self).init()
         if not self: return None
 
-        self.audio_monitor = AudioMonitor(update_callback=self._on_audio_update)
+        self.audio_monitor = AudioMonitor()
         self.audio_capture = AudioCapture(callback=self.audio_monitor.process_audio)
         self.is_monitoring = False
         
@@ -122,12 +124,10 @@ class MusicBarController(AppKit.NSObject):
         self.status_item = AppKit.NSStatusBar.systemStatusBar().statusItemWithLength_(AppKit.NSVariableStatusItemLength)
         button = self.status_item.button()
         button.setTitle_("♪")
-        button.setAction_(b'togglePopover:')
-        button.setTarget_(self)
 
     def setup_popover(self):
         self.popover = AppKit.NSPopover.alloc().init()
-        self.popover.setBehavior_(AppKit.NSPopoverBehaviorTransient)
+        self.popover.setBehavior_(AppKit.NSPopoverBehaviorApplicationDefined)
         self.popover.setAnimates_(True)
         
         self.stereo_view = StereoImageView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 150, 150))
@@ -141,9 +141,9 @@ class MusicBarController(AppKit.NSObject):
         noop_action = b'noop:'
         self.status_item_menu = self.create_menu_item("🔇 Not monitoring", noop_action, target=self)
         self.volume_item = self.create_menu_item("Volume: --", noop_action, target=self)
-        self.stereo_item = self.create_menu_item("Stereo: --", noop_action, target=self)
         self.bpm_item = self.create_menu_item("BPM: --", noop_action, target=self)
         self.chord_item = self.create_menu_item("Chord: --", noop_action, target=self)
+        self.instrument_item = self.create_menu_item("Instrument: --", noop_action, target=self)
         self.toggle_item = self.create_menu_item("Start Monitoring", b'toggleMonitoring:', target=self)
         
         self.device_menu = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Microphone Device", None, "")
@@ -153,9 +153,9 @@ class MusicBarController(AppKit.NSObject):
         self.menu.addItem_(self.status_item_menu)
         self.menu.addItem_(AppKit.NSMenuItem.separatorItem())
         self.menu.addItem_(self.volume_item)
-        self.menu.addItem_(self.stereo_item)
         self.menu.addItem_(self.bpm_item)
         self.menu.addItem_(self.chord_item)
+        self.menu.addItem_(self.instrument_item)
         self.menu.addItem_(AppKit.NSMenuItem.separatorItem())
         self.menu.addItem_(self.toggle_item)
         self.menu.addItem_(self.device_menu)
@@ -177,7 +177,11 @@ class MusicBarController(AppKit.NSObject):
         current_device_id = self.audio_capture.device
 
         for device in devices:
-            title = f"{device['name']} ({device['channels']}ch)"
+            if device['channels'] > 0:
+                title = f"{device['name']} ({device['channels']}ch)"
+            else:
+                title = f"{device['name']} (no input)"
+            
             if device['id'] == current_device_id:
                 title = f"✓ {title}"
             item = self.create_menu_item(title, b'selectDevice:', target=self)
@@ -189,6 +193,15 @@ class MusicBarController(AppKit.NSObject):
         device_id = sender.representedObject()
         if device_id == self.audio_capture.device: return
 
+        # Check if the device has input channels
+        devices = AudioCapture.list_devices()
+        selected_device = next((d for d in devices if d['id'] == device_id), None)
+        
+        if selected_device and selected_device['channels'] == 0:
+            self.show_alert("Invalid Device", 
+                          f"'{selected_device['name']}' has no input channels and cannot be used for audio monitoring.")
+            return
+
         was_monitoring = self.is_monitoring
         if was_monitoring: self.stop_monitoring()
         
@@ -197,13 +210,6 @@ class MusicBarController(AppKit.NSObject):
         
         if was_monitoring: self.start_monitoring()
         self.update_device_menu()
-
-    @objc.selector
-    def togglePopover_(self, sender):
-        if self.popover.isShown():
-            self.popover.close()
-        else:
-            self.popover.showRelativeToRect_ofView_preferredEdge_(sender.bounds(), sender, AppKit.NSMinYEdge)
 
     @objc.selector
     def toggleMonitoring_(self, sender):
@@ -235,12 +241,13 @@ class MusicBarController(AppKit.NSObject):
         self.status_item_menu.setTitle_("🔇 Not monitoring")
         self.status_item.button().setTitle_("♪")
         self.volume_item.setTitle_("Volume: --")
-        self.stereo_item.setTitle_("Stereo: --")
         self.bpm_item.setTitle_("BPM: --")
         self.chord_item.setTitle_("Chord: --")
+        self.instrument_item.setTitle_("Instrument: --")
         if self.popover.isShown(): self.popover.close()
         if config.debug: print("Audio monitoring stopped")
 
+    @call_on_main_thread
     @objc.python_method
     def refresh_display(self):
         if not self.is_monitoring: return
@@ -250,34 +257,39 @@ class MusicBarController(AppKit.NSObject):
 
             if avg_volume > 0.001:
                 volume_db_val = 20 * np.log10(avg_volume)
-                self.volume_item.setTitle_(f"Volume: {volume_db_val:.1f}dB")
-                if volume_db_val > -10: title = "♪🔊"
-                elif volume_db_val > -20: title = "♪🔉"
-                elif volume_db_val > -40: title = "♪🔈"
-                else: title = "♪📊"
+                self.volume_item.setTitle_(f"Volume: {volume_db_val:.1f} dB")
             else:
-                self.volume_item.setTitle_("Volume: Silence")
-                title = "♪📊"
-            self.status_item.button().setTitle_(title)
-
-            stereo_info = self.audio_monitor.get_stereo_info()
-            self.stereo_item.setTitle_(f"Stereo: {stereo_info['balance_description']} ({stereo_info['width_description']})")
+                self.volume_item.setTitle_("Volume: (silence)")
             
-            if self.stereo_view:
-                self.stereo_view.update_stereo_image(stereo_info.get('balance', 0.0), stereo_info.get('width', 0.0))
+            # Keep a permanent speaker icon when monitoring
+            self.status_item.button().setTitle_("♪🔊")
+            
+            self.bpm_item.setTitle_(f"BPM: {int(metrics.bpm)}")
+            
+            if metrics.chord_confidence > config.audio.chord_confidence_threshold:
+                self.chord_item.setTitle_(f"Chord: {metrics.chord} ({metrics.chord_confidence:.0%})")
+            else:
+                self.chord_item.setTitle_("Chord: N/A")
+            
+            # Display instrument detection results
+            if metrics.instrument_confidence > config.audio.instrument_confidence_threshold:
+                self.instrument_item.setTitle_(f"Instrument: {metrics.dominant_instrument} ({metrics.instrument_confidence:.0%})")
+            else:
+                self.instrument_item.setTitle_("Instrument: N/A")
 
-            self.bpm_item.setTitle_(f"BPM: {metrics.bpm:.1f}" if metrics.bpm > 0 else "BPM: --")
-            self.chord_item.setTitle_(f"Chord: {metrics.chord}")
+            if self.stereo_view:
+                self.stereo_view.update_stereo_image(metrics.stereo_balance, metrics.stereo_width)
 
         except Exception as e:
-            if config.debug: print(f"Error refreshing display: {e}")
-
-    @objc.python_method
-    def _on_audio_update(self, metrics: AudioMetrics):
-        pass # The UI timer handles all display updates
+            if config.debug:
+                print(f"Error refreshing display: {e}")
+                import traceback
+                traceback.print_exc()
 
     @objc.selector
     def showAbout_(self, sender):
+        # We need to activate the app to show a window
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
         self.show_alert(f"About {config.app_name}", f"{config.app_name} v{config.version}")
 
     @objc.python_method

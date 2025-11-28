@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Callable, List, Dict, Optional, Any
 from dataclasses import dataclass
-from utils.config import config
+from ..utils.config import config
 
 class AudioCaptureError(Exception):
     """Custom exception for audio capture errors."""
@@ -130,16 +130,37 @@ class AudioCapture:
         """List all available audio devices."""
         try:
             devices = sd.query_devices()
-            return [
-                {
-                    "id": i,
-                    "name": device["name"],
-                    "channels": device["max_input_channels"],
-                    "sample_rate": device["default_samplerate"]
-                }
-                for i, device in enumerate(devices)
-                if device["max_input_channels"] > 0
-            ]
+            device_list = []
+            
+            for i, device in enumerate(devices):
+                # Include devices with input channels > 0
+                if device["max_input_channels"] > 0:
+                    device_list.append({
+                        "id": i,
+                        "name": device["name"],
+                        "channels": device["max_input_channels"],
+                        "sample_rate": device["default_samplerate"],
+                        "type": "input"
+                    })
+                # Also include aggregate devices that might be useful for monitoring
+                # (devices with "aggregate" or "blackhole" in the name)
+                elif ("aggregate" in device["name"].lower() or 
+                      "blackhole" in device["name"].lower() or
+                      "bh +" in device["name"].lower()):
+                    device_list.append({
+                        "id": i,
+                        "name": device["name"] + " (output only)",
+                        "channels": 0,
+                        "sample_rate": device["default_samplerate"],
+                        "type": "output"
+                    })
+            
+            if config.debug:
+                print(f"Found {len(device_list)} audio devices:")
+                for device in device_list:
+                    print(f"  {device['id']}: {device['name']} ({device['channels']}ch input)")
+            
+            return device_list
         except Exception as e:
             if config.debug:
                 print(f"Error listing devices: {e}")
